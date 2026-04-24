@@ -1,0 +1,97 @@
+##############################################################
+# 광고 플랫폼 Lakehouse 실전 설계 - 실습 환경
+#
+# Week 1 (기본):  docker compose up
+# Week 2 (스트리밍): docker compose --profile streaming up
+##############################################################
+
+services:
+  # ─── Jupyter + PySpark + Iceberg ───────────────────────
+  spark-iceberg:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: spark-iceberg
+    ports:
+      - "8888:8888"   # Jupyter Notebook
+      - "4040:4040"   # Spark UI (job 실행 중에만 활성)
+    volumes:
+      - ./notebooks:/home/jovyan/work
+      - ./jobs:/home/jovyan/jobs
+      - ./data:/home/jovyan/data
+      - warehouse:/home/jovyan/warehouse
+      - ${HOME}/.aws:/home/jovyan/.aws:ro
+    environment:
+      JUPYTER_TOKEN: iceberg
+      AWS_PROFILE: ${AWS_PROFILE:-iceberg-lab}
+      AWS_REGION: ${AWS_REGION:-ap-northeast-2}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-ap-northeast-2}
+      AWS_SDK_LOAD_CONFIG: "1"
+    networks:
+      - lakehouse
+
+  # ─── Kafka (Week 2+: 스트리밍 실습용) ─────────────────
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    healthcheck:
+      test: ["CMD-SHELL", "cub zk-ready localhost:2181 5"]
+      interval: 5s
+      timeout: 10s
+      retries: 12
+      start_period: 10s
+    profiles: ["streaming"]
+    networks:
+      - lakehouse
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: kafka
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,PLAINTEXT_HOST://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 20s
+    profiles: ["streaming"]
+    networks:
+      - lakehouse
+
+  # Kafka UI (선택) - 토픽/메시지 시각화
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    ports:
+      - "8090:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+    depends_on:
+      - kafka
+    profiles: ["streaming"]
+    networks:
+      - lakehouse
+
+volumes:
+  warehouse:
+
+networks:
+  lakehouse:
+    driver: bridge
