@@ -1,10 +1,11 @@
 """
-결합된 광고 데이터를 확장 실습용 3토픽 이벤트로 분리한다.
+결합된 광고 데이터를 event-type 별 CSV 3개로 분리하는 보조 유틸.
 
-강의 기본 흐름:
-    ad_events.csv -> ad-events (단일 토픽)
+운영 파이프라인은 이미 kafka_producer.py 가 같은 분리 로직을 내장한다 (한 행 ->
+ad-impressions / ad-clicks / ad-conversions 3 토픽으로 분리 발행). 이 스크립트는
+Kafka 없이 raw CSV 단계에서 분리 결과를 미리 확인하거나, batch 백필 같은 별도
+용도로만 사용한다.
 
-확장 흐름:
     ad_events.csv -> (파생)
       events_impressions.csv
       events_clicks.csv
@@ -138,8 +139,8 @@ def split(input_csv, output_dir, seed=42):
     print("  이벤트 분리 완료")
     print("=" * 60)
     print()
-    print("  주의: 이 결과는 Criteo 결합 데이터를 3토픽으로 파생한 확장 실습용입니다.")
-    print("  강의 기본 경로는 단일 토픽 ad-events 입니다.")
+    print("  주의: 운영 파이프라인은 kafka_producer.py 가 같은 분리를 내장합니다.")
+    print("  이 CSV는 Kafka 없이 분리 결과를 점검하거나 batch 백필 용도로만 씁니다.")
     print()
     print(f"  Impressions:  {impressions_count:>8,}건  -> {imp_path}")
     print(f"  Clicks:       {len(clicks):>8,}건  -> {click_path}")

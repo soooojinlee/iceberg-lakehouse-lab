@@ -1,7 +1,15 @@
 """
-raw files -> processed_events Iceberg.
+raw files (3 zone) -> processed_events Iceberg.
 
-raw zone는 append-only 파일이고, 실제 테이블 관리는 processed_events부터 시작한다.
+bronze layer는 event-type 별로 plain parquet 3 zone으로 쌓여 있고
+(impressions / clicks / conversions), silver layer는 event_id 기준으로 join 해서
+한 행으로 조립한다.
+
+  raw/impressions/  + raw/clicks/  + raw/conversions/  ──>  processed_events (Iceberg)
+
+- impression이 base. click / conversion은 left-join으로 합류한다.
+- 같은 event_id에 conversion이 늦게 도착(=raw/conversions/에 새 파일이 생기)면
+  다음 MERGE 실행 시 source 행이 conversion=1으로 바뀌어 WHEN MATCHED 분기가 발화된다.
 """
 
 import argparse
@@ -69,41 +77,64 @@ def ensure_processed_table(spark, target_table, catalog_name, database):
     )
 
 
-def read_raw(spark, raw_path, raw_format):
-    df = spark.read.format(raw_format).load(raw_path)
-    return df
+def read_zone(spark, path, raw_format):
+    return spark.read.format(raw_format).load(path)
 
 
-def transform_raw(df):
+def transform_raw(impression_df, click_df, conversion_df):
+    """3 zone을 event_id로 join해 silver row를 조립한다.
+
+    각 zone은 streaming 재처리 등으로 같은 event_id가 중복 적재될 수 있으므로
+    event_id 기준 최신 ingest_ts row 하나만 골라 source-of-truth로 쓴다.
+    """
     from pyspark.sql.functions import (
+        coalesce,
         col,
         current_timestamp,
+        lit,
+        row_number,
         to_date,
-        when,
+    )
+    from pyspark.sql.window import Window
+
+    def latest_per_event(df):
+        win = Window.partitionBy("event_id").orderBy(col("ingest_ts").desc_nulls_last())
+        return df.withColumn("_rn", row_number().over(win)).filter(col("_rn") == 1).drop("_rn")
+
+    imp = latest_per_event(impression_df).select(
+        col("event_id"),
+        col("event_timestamp").alias("imp_event_ts"),
+        col("uid"),
+        col("campaign").cast("int").alias("campaign"),
+        col("cost").cast("double").alias("cost"),
     )
 
-    return (
-        df.withColumn("event_date", to_date(col("event_timestamp")))
-        .withColumn(
-            "conversion_delay_sec",
-            when(
-                col("conversion") == 1,
-                col("conversion_timestamp") - col("timestamp"),
-            ),
-        )
-        .withColumn("updated_at", current_timestamp())
-        .select(
-            col("event_id"),
-            col("event_date"),
-            col("uid"),
-            col("campaign").cast("int"),
-            col("click").cast("int"),
-            col("conversion").cast("int"),
-            col("conversion_delay_sec").cast("bigint"),
-            col("cost").cast("double"),
-            col("updated_at"),
-        )
-        .dropDuplicates(["event_id"])
+    clk = latest_per_event(click_df).select(
+        col("event_id"),
+        lit(1).alias("click_flag"),
+    )
+
+    cnv = latest_per_event(conversion_df).select(
+        col("event_id"),
+        lit(1).alias("conversion_flag"),
+        col("conversion_delay_sec").cast("bigint").alias("conversion_delay_sec"),
+    )
+
+    joined = (
+        imp.join(clk, "event_id", "left")
+        .join(cnv, "event_id", "left")
+    )
+
+    return joined.select(
+        col("event_id"),
+        to_date(col("imp_event_ts")).alias("event_date"),
+        col("uid"),
+        col("campaign"),
+        coalesce(col("click_flag"), lit(0)).cast("int").alias("click"),
+        coalesce(col("conversion_flag"), lit(0)).cast("int").alias("conversion"),
+        col("conversion_delay_sec"),
+        col("cost"),
+        current_timestamp().alias("updated_at"),
     )
 
 
@@ -159,8 +190,24 @@ def merge_recent(spark, transformed_df, target_table, merge_window_days):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="raw files -> processed_events Iceberg")
-    parser.add_argument("--raw-path", required=True)
+    parser = argparse.ArgumentParser(
+        description="raw files (3 zone) -> processed_events Iceberg (event_id join + MERGE)"
+    )
+    parser.add_argument(
+        "--impression-path",
+        required=True,
+        help="raw/impressions/ zone 경로",
+    )
+    parser.add_argument(
+        "--click-path",
+        required=True,
+        help="raw/clicks/ zone 경로",
+    )
+    parser.add_argument(
+        "--conversion-path",
+        required=True,
+        help="raw/conversions/ zone 경로",
+    )
     parser.add_argument("--raw-format", choices=["parquet", "json"], default="parquet")
     parser.add_argument("--catalog-mode", choices=["local", "glue"], default="local")
     parser.add_argument("--catalog-name", default="local")
@@ -180,16 +227,21 @@ def main():
     target_table = f"{args.catalog_name}.{args.database}.{args.table}"
     ensure_processed_table(spark, target_table, args.catalog_name, args.database)
 
-    raw_df = read_raw(spark, args.raw_path, args.raw_format)
-    processed_df = transform_raw(raw_df)
+    impression_df = read_zone(spark, args.impression_path, args.raw_format)
+    click_df = read_zone(spark, args.click_path, args.raw_format)
+    conversion_df = read_zone(spark, args.conversion_path, args.raw_format)
+
+    processed_df = transform_raw(impression_df, click_df, conversion_df)
 
     if args.mode == "full-refresh":
         full_refresh(spark, processed_df, target_table)
     else:
         merge_recent(spark, processed_df, target_table, args.merge_window_days)
 
-    print(f"processed target: {target_table}")
-    print(f"source raw path: {args.raw_path}")
+    print(f"processed target:  {target_table}")
+    print(f"impression source: {args.impression_path}")
+    print(f"click source:      {args.click_path}")
+    print(f"conversion source: {args.conversion_path}")
 
 
 if __name__ == "__main__":

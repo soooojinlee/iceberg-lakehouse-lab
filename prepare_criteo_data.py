@@ -386,8 +386,8 @@ def main():
     )
     print()
     print("  다음 단계:")
-    print("    python kafka_producer.py --csv ./data/ad_events.csv")
-    print("    python kafka_producer.py --realistic --csv ./data/ad_events.csv")
+    print("    python kafka_producer.py --create-topics --csv ./data/ad_events.csv --max-events 0  # 토픽 사전 생성")
+    print("    python kafka_producer.py --csv ./data/ad_events.csv                                # 3토픽 발행")
     print("=" * 60)
 
 

@@ -1,14 +1,28 @@
 """
-Spark Structured Streaming: Kafka -> raw files.
+Spark Structured Streaming: Kafka -> raw files (event-type 별 분리 zone).
 
-raw는 Iceberg 테이블이 아니라 append-only 파일 zone으로 둔다.
-기본 포맷은 parquet이며 raw_date / raw_hour 단위로 저장한다.
+raw zone는 Iceberg 테이블이 아니라 append-only 파일 zone이다. 한 spark-submit이
+한 토픽 -> 한 raw zone 을 처리하며, --event-type 으로 schema와 default topic을 결정한다.
+
+  --event-type impression  ->  ad-impressions  ->  raw/impressions/
+  --event-type click       ->  ad-clicks       ->  raw/clicks/
+  --event-type conversion  ->  ad-conversions  ->  raw/conversions/
+
+각 zone은 자체 schema의 plain parquet로 적재되고 (raw_date / raw_hour 파티션),
+silver layer (raw_to_processed_iceberg.py) 가 event_id 기준으로 조립한다.
 """
 
 import argparse
 
 
-def build_event_schema():
+EVENT_TYPE_DEFAULT_TOPIC = {
+    "impression": "ad-impressions",
+    "click": "ad-clicks",
+    "conversion": "ad-conversions",
+}
+
+
+def build_event_schema(event_type):
     from pyspark.sql.types import (
         DoubleType,
         IntegerType,
@@ -18,20 +32,31 @@ def build_event_schema():
         StructType,
     )
 
-    return StructType(
-        [
-            StructField("event_id", StringType()),
-            StructField("event_type", StringType()),
-            StructField("timestamp", LongType()),
-            StructField("event_time", StringType()),
-            StructField("uid", StringType()),
-            StructField("campaign", IntegerType()),
-            StructField("click", IntegerType()),
-            StructField("conversion", IntegerType()),
-            StructField("conversion_timestamp", LongType()),
-            StructField("cost", DoubleType()),
-        ]
-    )
+    common = [
+        StructField("event_id", StringType()),
+        StructField("event_type", StringType()),
+        StructField("timestamp", LongType()),
+        StructField("event_time", StringType()),
+        StructField("uid", StringType()),
+        StructField("campaign", IntegerType()),
+    ]
+
+    if event_type == "impression":
+        return StructType(common + [StructField("cost", DoubleType())])
+    if event_type == "click":
+        return StructType(
+            [common[0], common[1], common[2], common[3]]
+            + [StructField("impression_timestamp", LongType())]
+            + [common[4], common[5]]
+        )
+    if event_type == "conversion":
+        return StructType(
+            [common[0], common[1], common[2], common[3]]
+            + [StructField("impression_timestamp", LongType())]
+            + [common[4], common[5]]
+            + [StructField("conversion_delay_sec", LongType())]
+        )
+    raise ValueError(f"unsupported event-type: {event_type}")
 
 
 def build_spark(app_name, kafka_packages):
@@ -47,11 +72,25 @@ def build_spark(app_name, kafka_packages):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Kafka -> raw files streaming job")
+    parser = argparse.ArgumentParser(description="Kafka -> raw files streaming job (event-type 분리)")
+    parser.add_argument(
+        "--event-type",
+        choices=list(EVENT_TYPE_DEFAULT_TOPIC.keys()),
+        required=True,
+        help="처리할 이벤트 타입. schema와 default topic을 결정한다.",
+    )
     parser.add_argument("--bootstrap-servers", default="localhost:9092")
-    parser.add_argument("--topic", default="ad-events")
+    parser.add_argument(
+        "--topic",
+        default=None,
+        help="Kafka 토픽 (생략 시 event-type 기본값: impression->ad-impressions 등)",
+    )
     parser.add_argument("--starting-offsets", default="earliest")
-    parser.add_argument("--raw-path", required=True)
+    parser.add_argument(
+        "--raw-path",
+        required=True,
+        help="event-type 별 zone 경로. 예: /home/jovyan/warehouse/raw/impressions",
+    )
     parser.add_argument("--checkpoint-path", required=True)
     parser.add_argument("--output-format", choices=["parquet", "json"], default="parquet")
     parser.add_argument(
@@ -61,23 +100,25 @@ def main():
     )
     args = parser.parse_args()
 
+    topic = args.topic or EVENT_TYPE_DEFAULT_TOPIC[args.event_type]
+
     from pyspark.sql.functions import (
         col,
         current_timestamp,
         from_json,
+        from_unixtime,
         hour,
         to_date,
         to_timestamp,
-        from_unixtime,
     )
 
-    spark = build_spark("KafkaToRawFiles", args.kafka_packages)
-    schema = build_event_schema()
+    spark = build_spark(f"KafkaToRawFiles[{args.event_type}]", args.kafka_packages)
+    schema = build_event_schema(args.event_type)
 
     kafka_df = (
         spark.readStream.format("kafka")
         .option("kafka.bootstrap.servers", args.bootstrap_servers)
-        .option("subscribe", args.topic)
+        .option("subscribe", topic)
         .option("startingOffsets", args.starting_offsets)
         .load()
     )
@@ -105,9 +146,10 @@ def main():
         .start()
     )
 
-    print(f"raw path: {args.raw_path}")
-    print(f"checkpoint: {args.checkpoint_path}")
-    print(f"topic: {args.topic}")
+    print(f"event-type:  {args.event_type}")
+    print(f"topic:       {topic}")
+    print(f"raw path:    {args.raw_path}")
+    print(f"checkpoint:  {args.checkpoint_path}")
     query.awaitTermination()
 
 
