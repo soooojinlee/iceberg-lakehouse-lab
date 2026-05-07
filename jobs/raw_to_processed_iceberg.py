@@ -15,10 +15,10 @@ bronze layer는 event-type 별로 plain parquet 3 zone으로 쌓여 있고
 import argparse
 
 
-def build_spark(app_name, catalog_mode, catalog_name, warehouse):
+def build_spark(app_name, catalog_name, warehouse):
     from pyspark.sql import SparkSession
 
-    builder = (
+    return (
         SparkSession.builder.appName(app_name)
         .config("spark.sql.session.timeZone", "UTC")
         .config(
@@ -26,27 +26,17 @@ def build_spark(app_name, catalog_mode, catalog_name, warehouse):
             "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
         )
         .config(f"spark.sql.catalog.{catalog_name}", "org.apache.iceberg.spark.SparkCatalog")
+        .config(
+            f"spark.sql.catalog.{catalog_name}.catalog-impl",
+            "org.apache.iceberg.aws.glue.GlueCatalog",
+        )
+        .config(
+            f"spark.sql.catalog.{catalog_name}.io-impl",
+            "org.apache.iceberg.aws.s3.S3FileIO",
+        )
+        .config(f"spark.sql.catalog.{catalog_name}.warehouse", warehouse)
+        .getOrCreate()
     )
-
-    if catalog_mode == "glue":
-        builder = (
-            builder.config(
-                f"spark.sql.catalog.{catalog_name}.catalog-impl",
-                "org.apache.iceberg.aws.glue.GlueCatalog",
-            )
-            .config(
-                f"spark.sql.catalog.{catalog_name}.io-impl",
-                "org.apache.iceberg.aws.s3.S3FileIO",
-            )
-            .config(f"spark.sql.catalog.{catalog_name}.warehouse", warehouse)
-        )
-    else:
-        builder = (
-            builder.config(f"spark.sql.catalog.{catalog_name}.type", "hadoop")
-            .config(f"spark.sql.catalog.{catalog_name}.warehouse", warehouse)
-        )
-
-    return builder.getOrCreate()
 
 
 def ensure_processed_table(spark, target_table, catalog_name, database):
@@ -68,9 +58,9 @@ def ensure_processed_table(spark, target_table, catalog_name, database):
         PARTITIONED BY (event_date)
         TBLPROPERTIES (
             'format-version' = '2',
-            'write.update.mode' = 'copy-on-write',
-            'write.merge.mode' = 'copy-on-write',
-            'write.delete.mode' = 'copy-on-write',
+            'write.update.mode' = 'merge-on-read',
+            'write.merge.mode' = 'merge-on-read',
+            'write.delete.mode' = 'merge-on-read',
             'write.target-file-size-bytes' = '134217728'
         )
         """
@@ -78,7 +68,49 @@ def ensure_processed_table(spark, target_table, catalog_name, database):
 
 
 def read_zone(spark, path, raw_format):
-    return spark.read.format(raw_format).load(path)
+    """zone 의 모든 parquet 을 읽되, *Streaming sink 의 _spark_metadata 를 우회* 한다.
+
+    Spark Structured Streaming sink 가 만든 `_spark_metadata` 디렉토리는 *committed*
+    파일 목록을 추적한다. 이 디렉토리가 있으면 `spark.read.parquet(path)` 가 그 안의
+    파일만 보고 *물리적으로 S3 에 있는 다른 parquet 은 invisible* 해진다.
+    streaming 잡이 재기동되거나 commit 시점이 어긋나면 옛 commit 만 인덱스되어
+    새 데이터가 보이지 않는 현상이 생긴다.
+
+    해결: `raw_date=*/raw_hour=*` 패턴으로 *직접 path glob 읽기* — `_spark_metadata`
+    를 거치지 않고 raw_date / raw_hour 파티션 디렉토리 아래 parquet 을 그대로 읽는다.
+    """
+    from pyspark.sql.types import (
+        DoubleType,
+        IntegerType,
+        LongType,
+        StringType,
+        StructField,
+        StructType,
+        TimestampType,
+    )
+
+    glob_path = f"{path.rstrip('/')}/raw_date=*/raw_hour=*"
+    try:
+        df = spark.read.format(raw_format).load(glob_path)
+        _ = df.schema  # eager 로 schema 확정 → 비어있으면 여기서 AnalysisException
+        return df
+    except Exception as exc:
+        msg = str(exc)
+        if "Unable to infer schema" in msg or "Path does not exist" in msg:
+            print(f"warn: zone empty or missing, using empty DF: {glob_path}  ({exc.__class__.__name__})")
+            empty_schema = StructType(
+                [
+                    StructField("event_id", StringType()),
+                    StructField("event_timestamp", TimestampType()),
+                    StructField("ingest_ts", TimestampType()),
+                    StructField("uid", StringType()),
+                    StructField("campaign", IntegerType()),
+                    StructField("cost", DoubleType()),
+                    StructField("conversion_delay_sec", LongType()),
+                ]
+            )
+            return spark.createDataFrame([], empty_schema)
+        raise
 
 
 def transform_raw(impression_df, click_df, conversion_df):
@@ -142,10 +174,70 @@ def full_refresh(spark, transformed_df, target_table):
     transformed_df.writeTo(target_table).overwritePartitions()
 
 
-def merge_recent(spark, transformed_df, target_table, merge_window_days):
-    filtered = transformed_df.filter(
+def _filter_window(transformed_df, merge_window_days):
+    return transformed_df.filter(
         f"event_date >= current_date() - INTERVAL {merge_window_days} DAYS"
     )
+
+
+def insert_new_events(spark, transformed_df, target_table, merge_window_days):
+    """source 의 *새* event_id 만 INSERT.
+
+    MERGE 의 'WHEN NOT MATCHED THEN INSERT' 분기를 *별도 task* 로 분리.
+    LEFT ANTI JOIN 으로 target 에 없는 event_id 만 추린다 — 정상 흐름의 대부분.
+    """
+    filtered = _filter_window(transformed_df, merge_window_days)
+    filtered.createOrReplaceTempView("source_processed_events_insert")
+    spark.sql(
+        f"""
+        INSERT INTO {target_table}
+        SELECT
+          s.event_id,
+          s.event_date,
+          s.uid,
+          s.campaign,
+          s.click,
+          s.conversion,
+          s.conversion_delay_sec,
+          s.cost,
+          s.updated_at
+        FROM source_processed_events_insert s
+        LEFT ANTI JOIN {target_table} t
+          ON t.event_id = s.event_id
+        """
+    )
+
+
+def update_late_arrivals(spark, transformed_df, target_table, merge_window_days):
+    """source 의 *기존* event_id 에 conversion 이 새로 도착한 경우만 UPDATE.
+
+    MERGE 의 'WHEN MATCHED THEN UPDATE' 분기를 *별도 task* 로 분리.
+    INSERT-only 흐름은 conversion=0 으로 들어왔을 row 를 늦게 도착한 conversion 으로
+    갱신하는 것이 이 단계의 일.
+    """
+    filtered = _filter_window(transformed_df, merge_window_days)
+    filtered.createOrReplaceTempView("source_processed_events_update")
+    spark.sql(
+        f"""
+        MERGE INTO {target_table} t
+        USING source_processed_events_update s
+        ON t.event_id = s.event_id
+        WHEN MATCHED AND (
+              (s.conversion = 1 AND t.conversion = 0)
+           OR (s.click = 1 AND t.click = 0)
+        ) THEN
+          UPDATE SET
+            t.click = s.click,
+            t.conversion = s.conversion,
+            t.conversion_delay_sec = s.conversion_delay_sec,
+            t.updated_at = s.updated_at
+        """
+    )
+
+
+def merge_recent(spark, transformed_df, target_table, merge_window_days):
+    """combined merge (legacy) — INSERT + UPDATE 한 번에. backward compat."""
+    filtered = _filter_window(transformed_df, merge_window_days)
     filtered.createOrReplaceTempView("source_processed_events")
     spark.sql(
         f"""
@@ -164,26 +256,11 @@ def merge_recent(spark, transformed_df, target_table, merge_window_days):
             t.updated_at = s.updated_at
         WHEN NOT MATCHED THEN
           INSERT (
-            event_id,
-            event_date,
-            uid,
-            campaign,
-            click,
-            conversion,
-            conversion_delay_sec,
-            cost,
-            updated_at
-          )
-          VALUES (
-            s.event_id,
-            s.event_date,
-            s.uid,
-            s.campaign,
-            s.click,
-            s.conversion,
-            s.conversion_delay_sec,
-            s.cost,
-            s.updated_at
+            event_id, event_date, uid, campaign,
+            click, conversion, conversion_delay_sec, cost, updated_at
+          ) VALUES (
+            s.event_id, s.event_date, s.uid, s.campaign,
+            s.click, s.conversion, s.conversion_delay_sec, s.cost, s.updated_at
           )
         """
     )
@@ -209,18 +286,30 @@ def main():
         help="raw/conversions/ zone 경로",
     )
     parser.add_argument("--raw-format", choices=["parquet", "json"], default="parquet")
-    parser.add_argument("--catalog-mode", choices=["local", "glue"], default="local")
-    parser.add_argument("--catalog-name", default="local")
-    parser.add_argument("--warehouse", default="/home/jovyan/warehouse")
+    parser.add_argument("--catalog-name", default="glue_catalog")
+    parser.add_argument(
+        "--warehouse",
+        required=True,
+        help="S3 warehouse 경로 (예: s3://<bucket>/lakehouse-lab/warehouse)",
+    )
     parser.add_argument("--database", default="ad_lakehouse")
     parser.add_argument("--table", default="processed_events")
-    parser.add_argument("--mode", choices=["merge", "full-refresh"], default="merge")
+    parser.add_argument(
+        "--mode",
+        choices=["insert", "update", "merge", "full-refresh"],
+        default="merge",
+        help=(
+            "insert: 새 event_id 만 INSERT (anti-join). "
+            "update: 기존 event_id 의 늦게 도착한 conversion/click 만 MERGE-UPDATE. "
+            "merge: 위 둘을 한 번에 (legacy). "
+            "full-refresh: 전체 덮어쓰기."
+        ),
+    )
     parser.add_argument("--merge-window-days", type=int, default=7)
     args = parser.parse_args()
 
     spark = build_spark(
         "RawToProcessedIceberg",
-        args.catalog_mode,
         args.catalog_name,
         args.warehouse,
     )
@@ -235,6 +324,10 @@ def main():
 
     if args.mode == "full-refresh":
         full_refresh(spark, processed_df, target_table)
+    elif args.mode == "insert":
+        insert_new_events(spark, processed_df, target_table, args.merge_window_days)
+    elif args.mode == "update":
+        update_late_arrivals(spark, processed_df, target_table, args.merge_window_days)
     else:
         merge_recent(spark, processed_df, target_table, args.merge_window_days)
 

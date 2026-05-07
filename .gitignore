@@ -1,2 +1,12 @@
 .venv/
 __pycache__/
+
+# 환경 설정 (bucket / prefix 등 — .env.example 참고하여 본인 값으로 채우기)
+.env
+
+# Claude / 보조 툴 산출물
+.omc/
+
+# 런타임 산출물
+data/*.csv
+notebooks/.ipynb_checkpoints/

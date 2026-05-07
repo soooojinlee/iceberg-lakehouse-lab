@@ -81,7 +81,7 @@ def generate_ad_events(
     num_events=100_000,
     num_users=10_000,
     num_campaigns=50,
-    start_date="2026-01-01",
+    start_date=None,
     days=7,
     output_dir="./data",
     seed=42,
@@ -89,7 +89,15 @@ def generate_ad_events(
     rng = random.Random(seed)
     os.makedirs(output_dir, exist_ok=True)
 
-    start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+    # start_date 가 None 이면 *마지막 날이 오늘이 되도록* 자동 계산.
+    # 7회차 자동화 시연에서 silver/gold 의 `event_date >= current_date() - INTERVAL 7 DAYS`
+    # 윈도우와 자연 매칭되도록 기본값을 동적으로 잡는다.
+    if start_date is None:
+        today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        start_dt = today - timedelta(days=max(days - 1, 0))
+        start_date = start_dt.strftime("%Y-%m-%d")
+    else:
+        start_dt = datetime.strptime(start_date, "%Y-%m-%d")
     start_ts = int(start_dt.timestamp())
     total_seconds = days * 86400
 
@@ -205,7 +213,11 @@ if __name__ == "__main__":
     parser.add_argument("--events", type=int, default=100_000, help="생성할 이벤트 수 (기본: 100,000)")
     parser.add_argument("--users", type=int, default=10_000, help="유저 수 (기본: 10,000)")
     parser.add_argument("--campaigns", type=int, default=50, help="캠페인 수 (기본: 50)")
-    parser.add_argument("--start-date", default="2026-01-01", help="시작일 (기본: 2026-01-01)")
+    parser.add_argument(
+        "--start-date",
+        default=None,
+        help="시작일 YYYY-MM-DD. 생략 시 *마지막 날이 오늘*이 되도록 자동 계산 (기본 동작)",
+    )
     parser.add_argument("--days", type=int, default=7, help="기간 일수 (기본: 7)")
     parser.add_argument("--output", default="./data", help="출력 디렉토리 (기본: ./data)")
     parser.add_argument("--seed", type=int, default=42, help="랜덤 시드 (기본: 42)")

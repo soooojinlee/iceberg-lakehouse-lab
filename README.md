@@ -1,5 +1,7 @@
 # 광고 플랫폼 Lakehouse 실전 설계 - 실습 환경
 
+> **8회차 최종 프로젝트 안내**: [`docs/final-project-guide.md`](docs/final-project-guide.md)
+
 이 repo는 강의 개요의 `Raw -> Processing -> Summary` 흐름은 유지하되, 저장 계층은 다음처럼 가져간다.
 
 - `raw`: Iceberg 테이블이 아니라 **이벤트 타입별 plain parquet append zone** (impressions / clicks / conversions)
@@ -313,6 +315,151 @@ docker compose exec spark-iceberg \
 ```
 
 기본 동작은 최근 7일을 재집계해 `campaign_summary`에 MERGE 한다.
+
+## 7단계: Airflow로 매시간 / 매일 자동화
+
+5/6단계의 `spark-submit`을 손으로 돌리는 대신, Airflow가 매시간 MERGE / 매일 maintenance를 호출하게 한다.
+DAG 안의 task는 결국 README 5/6단계와 **같은 명령**을 `docker exec spark-iceberg ...` 형태로 부른다.
+즉 자동화 전후의 "코드"는 다르지 않고, 그것을 *누가 언제 호출하느냐*만 바뀐다.
+
+### 구성
+
+| 컨테이너 | 역할 |
+|---|---|
+| `airflow-postgres` | Airflow 메타데이터 DB |
+| `airflow-init` | 최초 1회 DB migrate + admin 사용자 생성 |
+| `airflow-webserver` | Web UI (`http://localhost:8080`, admin / admin) |
+| `airflow-scheduler` | DAG 스케줄링 / 실행 |
+
+빌드 정의:
+- `Dockerfile.airflow` — `apache/airflow:2.11.x` 기반에 `docker` CLI 추가 (BashOperator가 `docker exec` 호출용)
+- `dags/ad_lakehouse_silver_merge.py` — 매시간 :00, raw 3 zone → `processed_events` (raw 비어있으면 가드)
+- `dags/ad_lakehouse_gold_aggregation.py` — 매시간 :30 (silver 뒤), `processed_events` → `campaign_summary`
+- `dags/ad_lakehouse_daily_maintenance.py` — 매일 새벽 3시(UTC), compact → rewrite-deletes → expire → (일요일) orphan
+- `jobs/iceberg_maintenance.py` — `rewrite_data_files` / `rewrite_position_delete_files` / `expire_snapshots` / `remove_orphan_files` 래퍼
+
+### 테이블 모드: Merge-on-Read (MOR)
+
+`processed_events`, `campaign_summary` 둘 다 MOR 로 만들어진다.
+
+```
+TBLPROPERTIES (
+  'format-version' = '2',
+  'write.update.mode' = 'merge-on-read',
+  'write.merge.mode'  = 'merge-on-read',
+  'write.delete.mode' = 'merge-on-read'
+)
+```
+
+매시간 MERGE 워크로드에서 COW 는 행 한 줄 변경에도 데이터 파일 전체를 다시 쓰므로
+write amplification 이 크다. MOR 은 position delete 파일을 추가하고 데이터 파일은
+재사용해 commit latency 가 짧아진다. 단, read 시 delete 파일을 머지해야 하므로
+**MOR + 정기 compaction (`rewrite_data_files`) + delete 파일 재작성 (`rewrite_position_delete_files`)
+이 한 묶음**이며, daily maintenance DAG 이 그 역할을 맡는다.
+
+### 실행
+
+```bash
+# 0) spark-iceberg + Kafka + Airflow 까지 같이 띄운다
+docker compose up -d --build
+docker compose --profile streaming up -d
+docker compose --profile airflow up -d --build
+
+# 컨테이너 상태 확인
+docker compose ps
+```
+
+Web UI 접속:
+- Airflow: `http://localhost:8080` (admin / admin)
+- Spark UI: `http://localhost:4040` (job 실행 중에만)
+- Jupyter: `http://localhost:8888`
+- Kafka UI: `http://localhost:8090`
+
+### 카탈로그 모드 전환
+
+기본은 `local`(hadoop catalog, 자체 완결 데모) 이다. Glue + S3 모드로 흐름을 보여주려면 호스트 셸에서 환경 변수만 바꿔서 Airflow를 다시 띄우면 된다.
+
+```bash
+export ICEBERG_CATALOG_MODE=glue
+export ICEBERG_CATALOG_NAME=glue_catalog
+export ICEBERG_WAREHOUSE=s3://<your-bucket>/warehouse
+export ICEBERG_RAW_BASE=s3://<your-bucket>/raw
+
+docker compose --profile airflow up -d --force-recreate airflow-webserver airflow-scheduler
+```
+
+`spark-iceberg` 컨테이너는 호스트의 `~/.aws`를 마운트하므로 별도 자격증명 주입은 필요 없다.
+
+### DAG 시연 흐름
+
+```
+[Airflow Web UI]
+   │
+   ├─ ad_lakehouse_silver_merge       schedule: 0 * * * *
+   │     ├─ check_raw_zones_have_data
+   │     └─ merge_raw_to_processed    (docker exec → raw_to_processed_iceberg.py)
+   │
+   ├─ ad_lakehouse_gold_aggregation   schedule: 30 * * * *
+   │     └─ aggregate_processed_to_summary  (docker exec → processed_to_campaign_summary.py)
+   │
+   └─ ad_lakehouse_daily_maintenance  schedule: 0 3 * * *
+         ├─ compact_processed_events
+         ├─ compact_campaign_summary
+         ├─ rewrite_position_deletes_all   (MOR delete 파일 정리)
+         ├─ expire_snapshots_all
+         └─ remove_orphan_files_weekly      (UTC 일요일에만 실제 동작)
+```
+
+silver(:00) 와 gold(:30) 는 30분 오프셋만 가진 독립 DAG. silver 가 늦어도 gold 의
+7일 윈도우 재집계가 다음 사이클에 자연 회복하므로 cross-DAG sensor 없이도 안전하다.
+
+### 한 사이클을 한 번에 — 부트스트랩 스크립트
+
+시연 자리에서 Kafka 발행 → streaming → silver/gold/maintenance 까지 한 번에 돌리는 헬퍼.
+
+```bash
+# spark + kafka + airflow 가 모두 떠 있는 상태에서
+./scripts/run_demo_cycle.sh
+
+# 옵션
+EVENTS=2000 SPEED=500 ./scripts/run_demo_cycle.sh
+```
+
+스크립트가 하는 일:
+1. 필요한 컨테이너가 떠 있는지 확인
+2. 샘플 데이터 생성 (없으면)
+3. Kafka 토픽 생성 + producer 짧게 발행
+4. 3 zone streaming 잡 띄워 raw 적재
+5. `silver_merge` → `gold_aggregation` → `daily_maintenance` 순차 trigger + 완료 대기
+6. snapshot 카운트 요약 출력
+
+### 시연 시나리오 (수동)
+
+1. Kafka producer를 띄워 raw zone에 이벤트가 쌓이는 상태를 만든다 (3단계 + 4단계).
+2. Airflow Web UI에서 `ad_lakehouse_silver_merge` 를 manual trigger → Graph view에서 가드 → MERGE 흐름 확인.
+3. 이어서 `ad_lakehouse_gold_aggregation` 을 trigger → `campaign_summary` snapshot 갱신 확인.
+4. spark-iceberg 컨테이너의 Spark UI(`http://localhost:4040`)에서 실제 잡 동작 확인.
+5. `processed_events` / `campaign_summary` 의 snapshot 수가 늘어나는 것을 확인.
+6. `ad_lakehouse_daily_maintenance` 를 trigger → compaction → rewrite-deletes → expire 흐름까지 본다.
+
+### 트러블슈팅
+
+| 증상 | 원인 / 대응 |
+|---|---|
+| `docker exec` 로 시작한 task가 `permission denied` | `/var/run/docker.sock` 마운트가 안 됐거나 컨테이너가 root가 아닌 상태. compose의 `user: "0:0"` 설정 확인 |
+| DAG이 Web UI에 안 뜸 | `dags/` 디렉토리 마운트 또는 파일 syntax 오류. `docker compose logs airflow-scheduler` 로 stack trace 확인 |
+| `airflow-init` 가 계속 재시작됨 | postgres 가 아직 `pg_isready` 통과 전. `docker compose logs airflow-postgres` 로 확인 |
+| `spark-iceberg: not found` | airflow와 spark-iceberg 가 같은 `lakehouse` 네트워크에 있는지 확인. compose 파일 수정 시 `--force-recreate` 권장 |
+
+### 종료
+
+```bash
+docker compose --profile airflow down
+# 메타데이터까지 초기화하려면
+docker compose --profile airflow down -v
+```
+
+---
 
 ## 부록: S3 raw-only 파이프라인 실행 가이드
 

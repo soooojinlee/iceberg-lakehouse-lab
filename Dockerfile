@@ -15,15 +15,22 @@ USER root
 # - hadoop-aws + aws-java-sdk-bundle: raw zone 등 s3a:// 경로 읽기/쓰기 (SDK v1)
 ENV ICEBERG_VERSION=1.5.2
 ENV SPARK_MAJOR=3.5
+ENV SPARK_VERSION=3.5.3
 ENV SCALA_MAJOR=2.12
 ENV HADOOP_AWS_VERSION=3.3.4
 ENV AWS_SDK_BUNDLE_VERSION=1.12.262
+ENV KAFKA_CLIENTS_VERSION=3.4.1
+ENV COMMONS_POOL2_VERSION=2.11.1
 
 RUN cd /usr/local/spark/jars && \
     wget -q "https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-spark-runtime-${SPARK_MAJOR}_${SCALA_MAJOR}/${ICEBERG_VERSION}/iceberg-spark-runtime-${SPARK_MAJOR}_${SCALA_MAJOR}-${ICEBERG_VERSION}.jar" && \
     wget -q "https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-aws-bundle/${ICEBERG_VERSION}/iceberg-aws-bundle-${ICEBERG_VERSION}.jar" && \
     wget -q "https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/${HADOOP_AWS_VERSION}/hadoop-aws-${HADOOP_AWS_VERSION}.jar" && \
-    wget -q "https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk-bundle/${AWS_SDK_BUNDLE_VERSION}/aws-java-sdk-bundle-${AWS_SDK_BUNDLE_VERSION}.jar"
+    wget -q "https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk-bundle/${AWS_SDK_BUNDLE_VERSION}/aws-java-sdk-bundle-${AWS_SDK_BUNDLE_VERSION}.jar" && \
+    wget -q "https://repo1.maven.org/maven2/org/apache/spark/spark-sql-kafka-0-10_${SCALA_MAJOR}/${SPARK_VERSION}/spark-sql-kafka-0-10_${SCALA_MAJOR}-${SPARK_VERSION}.jar" && \
+    wget -q "https://repo1.maven.org/maven2/org/apache/spark/spark-token-provider-kafka-0-10_${SCALA_MAJOR}/${SPARK_VERSION}/spark-token-provider-kafka-0-10_${SCALA_MAJOR}-${SPARK_VERSION}.jar" && \
+    wget -q "https://repo1.maven.org/maven2/org/apache/kafka/kafka-clients/${KAFKA_CLIENTS_VERSION}/kafka-clients-${KAFKA_CLIENTS_VERSION}.jar" && \
+    wget -q "https://repo1.maven.org/maven2/org/apache/commons/commons-pool2/${COMMONS_POOL2_VERSION}/commons-pool2-${COMMONS_POOL2_VERSION}.jar"
 
 # s3a 가 AWS_PROFILE + ~/.aws/credentials 를 쓰도록 기본 자격 공급자 체인 지정
 RUN echo "spark.hadoop.fs.s3a.aws.credentials.provider com.amazonaws.auth.DefaultAWSCredentialsProviderChain" \

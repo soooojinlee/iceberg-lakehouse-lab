@@ -1,0 +1,16 @@
+######################################################################
+# Airflow 이미지 (lab 전용)
+#
+# 기본 apache/airflow에 docker CLI 만 추가한다.
+# Airflow의 BashOperator가 `docker exec spark-iceberg ...` 형태로
+# 옆 컨테이너의 spark-submit을 호출할 수 있어야 한다.
+######################################################################
+
+FROM apache/airflow:2.11.2-python3.11
+
+USER root
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends docker.io \
+    && rm -rf /var/lib/apt/lists/*
+
+USER airflow
